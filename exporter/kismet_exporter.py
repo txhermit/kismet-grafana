@@ -6,10 +6,11 @@ Polls Kismet's REST API (the same interface the Kismet web UI itself uses) for
 device snapshots, GPS position, and server status, and exposes the results for
 Prometheus to scrape.
 
-A background eventbus websocket thread additionally subscribes to the ALERT and
-GPS topics for low-latency updates. If the eventbus is unreachable, the
-exporter keeps working on REST polling alone -- the eventbus is an
-enhancement, not a dependency.
+A background eventbus websocket thread additionally subscribes to the ALERT,
+GPS, and DOT11_PROBED_SSID topics for low-latency updates (alerts, position,
+and probe requests -- the same probe topic the Kismet probe-dashboard plugin
+uses). If the eventbus is unreachable, the exporter keeps working on REST
+polling alone -- the eventbus is an enhancement, not a dependency.
 
     python3 kismet_exporter.py            # live mode, needs KISMET_API_KEY
     python3 kismet_exporter.py --demo     # synthetic data, no Kismet needed
@@ -96,6 +97,9 @@ GPS_ALT = Gauge("kismet_gps_altitude_m", "GPS altitude in meters")
 GPS_SPEED = Gauge("kismet_gps_speed_ms", "GPS speed in meters per second")
 GPS_FIX = Gauge("kismet_gps_fix", "GPS fix type (0=none, 2=2D, 3=3D)")
 ALERTS = Counter("kismet_alerts_total", "Kismet alerts seen", ["alert"])
+PROBES = Counter("kismet_probe_requests_total",
+                 "Probe requests observed via the DOT11_PROBED_SSID eventbus",
+                 ["ssid"])
 KINFO = Info("kismet", "Kismet server info")
 
 # ------------------------------------------------------------ live source ---
@@ -195,6 +199,11 @@ class DemoSource:
             self.devs.pop(random.randrange(len(self.devs)))
         if random.random() < 0.06:
             ALERTS.labels(alert=random.choice(DEMO_ALERTS)).inc()
+        # fake probe traffic: clients shouting for remembered networks
+        if random.random() < 0.5:
+            record_probe(random.choice(
+                DEMO_SSIDS + ["FBI Surveillance Van", "Pretty Fly for a WiFi",
+                              "Motel 6", None]))
         return [{
             "kismet.device.base.macaddr": d["mac"],
             "kismet.device.base.commonname": d["name"] or "",
@@ -338,8 +347,42 @@ def handle_eventbus_message(msg):
             ALERTS.labels(alert=str(name)[:48]).inc()
         elif topic == "GPS":
             update_gps(data)
+        elif topic == "DOT11_PROBED_SSID":
+            record_probe(probe_ssid_from_event(data))
     except Exception as exc:  # never let the bus thread die loudly
         LOG.debug("eventbus message skipped: %s", exc)
+
+
+# Likely field paths for the probed SSID inside a DOT11_PROBED_SSID event.
+# The first payload's keys are logged at info so the mapping can be verified
+# against a live Kismet; unknown layouts fall back to "(unknown)" instead of
+# guessing.
+_PROBE_SSID_KEYS = (
+    "dot11.probedssid.ssid",
+    "kismet.dot11.probedssid.ssid",
+    "dot11.probe.ssid",
+    "ssid",
+)
+_logged_probe_layout = False
+
+
+def probe_ssid_from_event(data):
+    global _logged_probe_layout
+    if not _logged_probe_layout:
+        _logged_probe_layout = True
+        LOG.info("first DOT11_PROBED_SSID payload keys: %s",
+                 sorted(str(k) for k in data.keys()))
+    for key in _PROBE_SSID_KEYS:
+        value = data.get(key)
+        if value:
+            return str(value)
+    return "(unknown)"
+
+
+def record_probe(ssid):
+    """Count one probe request. Empty/None SSID = broadcast probe."""
+    label = (ssid or "").strip()[:64] or "(broadcast)"
+    PROBES.labels(ssid=label).inc()
 
 
 def eventbus_loop(source):
@@ -356,9 +399,9 @@ def eventbus_loop(source):
         try:
             ws = websocket.create_connection(ws_url, header=headers,
                                              timeout=15)
-            for topic in ("ALERT", "GPS"):
+            for topic in ("ALERT", "GPS", "DOT11_PROBED_SSID"):
                 ws.send(json.dumps({"SUBSCRIBE": topic}))
-            LOG.info("eventbus: subscribed to ALERT, GPS")
+            LOG.info("eventbus: subscribed to ALERT, GPS, DOT11_PROBED_SSID")
             while True:
                 handle_eventbus_message(json.loads(ws.recv()))
         except Exception as exc:

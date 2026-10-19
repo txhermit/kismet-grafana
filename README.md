@@ -65,6 +65,16 @@ Metrics exposed (see `:9102/metrics`):
 | `kismet_device_latitude/longitude{mac,name,phy}` | positions of loudest N (for map experiments) |
 | `kismet_gps_latitude/longitude/altitude_m/speed_ms/fix` | receiver position |
 | `kismet_alerts_total{alert}` | alerts via eventbus |
+| `kismet_probe_requests_total{ssid}` | probe requests via the `DOT11_PROBED_SSID` eventbus topic (same feed the Kismet probe-dashboard plugin uses); `(broadcast)` = wildcard probe |
+
+### Probe requests
+
+Clients constantly shout probe requests for networks they remember -- the
+exporter counts them per SSID straight off the eventbus, no REST polling
+involved. The dashboard shows the top probed SSIDs and the probe rate. On the
+first live run the exporter logs the raw event's field names at info level so
+you can confirm the SSID field mapping against your Kismet build; anything
+unrecognized lands in `(unknown)` rather than being guessed at.
 
 ## Kismet API key
 
