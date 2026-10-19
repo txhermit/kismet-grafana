@@ -1,0 +1,43 @@
+# Kismet runs natively on the host (it needs monitor-mode USB hardware, which we
+# deliberately keep out of Docker). Everything here talks to Kismet over its
+# REST API + eventbus websocket on port 2501.
+services:
+  prometheus:
+    image: prom/prometheus:v3.0.0
+    container_name: kismet-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: kismet-grafana
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-wardrive}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    restart: unless-stopped
+
+  exporter:
+    build: ./exporter
+    container_name: kismet-exporter
+    env_file: .env
+    # Lets the exporter reach Kismet on the host's localhost:2501.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "9102:9102"
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:
