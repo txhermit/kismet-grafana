@@ -78,14 +78,15 @@ unrecognized lands in `(unknown)` rather than being guessed at.
 
 ## Kismet API key
 
-The exporter authenticates with HTTP basic auth, API key as the username and a
-blank password (the standard Kismet convention for scripts). `up.sh` resolves
-the key in this order: `$KISMET_API_KEY` env -> `~/.kismet/kismet_httpd.conf` ->
-interactive prompt. It lands in `.env`, which is git-ignored -- never commit
-it.
+Kismet accepts API keys only as the `KISMET` session cookie (REST calls) or
+the `?KISMET=` URI parameter (websockets) -- keys are *not* valid HTTP
+basic-auth credentials. Basic auth is the admin username/password only, and a
+key presented that way always gets a 401. The exporter sends the key as a
+cookie on its REST polls and as a URI parameter on the eventbus websocket.
 
-If your Kismet build instead wants the key as the basic-auth *password*, set
-`KISMET_APIKEY_AS_PASSWORD=1` in `.env` and restart the exporter.
+`up.sh` resolves the key in this order: `$KISMET_API_KEY` env ->
+`~/.kismet/kismet_httpd.conf` -> interactive prompt. It lands in `.env`,
+which is git-ignored -- never commit it.
 
 ## Configuration
 

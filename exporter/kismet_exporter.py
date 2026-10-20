@@ -20,18 +20,19 @@ Environment:
                                 default: http://host.docker.internal:2501
     KISMET_API_KEY              Kismet API key (required in live mode).
                                 Create one in the Kismet web UI under
-                                Settings -> API Keys.
-    KISMET_APIKEY_AS_PASSWORD   set to 1 if your Kismet build expects the API
-                                key as the HTTP basic-auth password instead of
-                                the username (default: key as username, blank
-                                password).
+                                Settings -> API Keys. The key is sent as the
+                                KISMET cookie on REST calls and as the
+                                ?KISMET= URI parameter on the eventbus
+                                websocket -- Kismet does not accept API keys
+                                as HTTP basic auth (basic auth is the admin
+                                username/password only; a key presented that
+                                way always gets a 401).
     EXPORTER_PORT               default: 9102
     POLL_INTERVAL               seconds between REST polls, default: 5
     TOP_N                       how many of the loudest devices get individual
                                 signal/location series, default: 15
 """
 
-import base64
 import json
 import logging
 import math
@@ -40,9 +41,9 @@ import random
 import sys
 import threading
 import time
+from urllib.parse import quote
 
 import requests
-from requests.auth import HTTPBasicAuth
 from prometheus_client import Counter, Gauge, Info, start_http_server
 
 try:
@@ -55,7 +56,6 @@ LOG = logging.getLogger("kismet-exporter")
 
 KISMET_URL = os.environ.get("KISMET_URL", "http://host.docker.internal:2501").rstrip("/")
 API_KEY = os.environ.get("KISMET_API_KEY", "")
-KEY_AS_PASSWORD = os.environ.get("KISMET_APIKEY_AS_PASSWORD", "") == "1"
 PORT = int(os.environ.get("EXPORTER_PORT", "9102"))
 POLL = float(os.environ.get("POLL_INTERVAL", "5"))
 TOP_N = int(os.environ.get("TOP_N", "15"))
@@ -108,17 +108,20 @@ KINFO = Info("kismet", "Kismet server info")
 class KismetSource:
     """Reads live state from Kismet's REST API."""
 
-    def __init__(self, base_url, api_key, key_as_password=False):
+    def __init__(self, base_url, api_key):
         self.base = base_url
+        self.api_key = api_key
         self.sess = requests.Session()
-        if key_as_password:
-            self.sess.auth = HTTPBasicAuth("kismet", api_key)
-            self._basic = base64.b64encode(
-                ("kismet:%s" % api_key).encode()).decode()
-        else:
-            self.sess.auth = HTTPBasicAuth(api_key, "")
-            self._basic = base64.b64encode(
-                ("%s:" % api_key).encode()).decode()
+        # Kismet accepts API keys only as the KISMET session cookie (REST)
+        # or the ?KISMET= URI parameter (websockets). HTTP basic auth is
+        # the admin login only; a key sent as basic auth always 401s.
+        self.sess.cookies.set("KISMET", api_key)
+
+    def eventbus_url(self):
+        ws = (self.base.replace("https://", "wss://")
+                       .replace("http://", "ws://"))
+        return ws + "/eventbus/events.ws?KISMET=" + quote(self.api_key,
+                                                          safe="")
 
     def devices(self):
         """All currently tracked devices, field-simplified."""
@@ -141,8 +144,6 @@ class KismetSource:
         r.raise_for_status()
         return r.json()
 
-    def basic_auth_header(self):
-        return {"Authorization": "Basic " + self._basic}
 
 
 # ------------------------------------------------------------ demo source ---
@@ -390,15 +391,12 @@ def eventbus_loop(source):
     if this thread can never connect."""
     if DEMO or not HAS_WS or not isinstance(source, KismetSource):
         return
-    ws_url = (KISMET_URL.replace("https://", "wss://")
-                       .replace("http://", "ws://")
-              + "/eventbus/events.ws")
-    headers = source.basic_auth_header()
-    LOG.info("eventbus: connecting to %s", ws_url)
+    ws_url = source.eventbus_url()
+    LOG.info("eventbus: connecting to %s/eventbus/events.ws",
+             KISMET_URL)
     while True:
         try:
-            ws = websocket.create_connection(ws_url, header=headers,
-                                             timeout=15)
+            ws = websocket.create_connection(ws_url, timeout=15)
             for topic in ("ALERT", "GPS", "DOT11_PROBED_SSID"):
                 ws.send(json.dumps({"SUBSCRIBE": topic}))
             LOG.info("eventbus: subscribed to ALERT, GPS, DOT11_PROBED_SSID")
@@ -424,7 +422,7 @@ def main():
                       "Create one in the Kismet web UI under Settings -> API Keys, "
                       "or run with --demo.")
             sys.exit(2)
-        source = KismetSource(KISMET_URL, API_KEY, KEY_AS_PASSWORD)
+        source = KismetSource(KISMET_URL, API_KEY)
         LOG.info("polling Kismet at %s every %ss", KISMET_URL, POLL)
 
     start_http_server(PORT)
