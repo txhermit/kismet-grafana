@@ -7,9 +7,9 @@ device snapshots, GPS position, and server status, and exposes the results for
 Prometheus to scrape.
 
 A background eventbus websocket thread additionally subscribes to the ALERT,
-GPS, and DOT11_PROBED_SSID topics for low-latency updates (alerts, position,
-and probe requests -- the same probe topic the Kismet probe-dashboard plugin
-uses). If the eventbus is unreachable, the exporter keeps working on REST
+GPS_LOCATION, and DOT11_PROBED_SSID topics for low-latency updates (alerts,
+position, and probe requests -- the same probe topic the Kismet probe-dashboard
+plugin uses). If the eventbus is unreachable, the exporter keeps working on REST
 polling alone -- the eventbus is an enhancement, not a dependency.
 
     python3 kismet_exporter.py            # live mode, needs KISMET_API_KEY
@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover
 LOG = logging.getLogger("kismet-exporter")
 
 KISMET_URL = os.environ.get("KISMET_URL", "http://host.docker.internal:2501").rstrip("/")
-API_KEY = os.environ.get("KISMET_API_KEY", "")
+API_KEY = os.environ.get("KISMET_API_KEY", "").strip()
 PORT = int(os.environ.get("EXPORTER_PORT", "9102"))
 POLL = float(os.environ.get("POLL_INTERVAL", "5"))
 TOP_N = int(os.environ.get("TOP_N", "15"))
@@ -333,23 +333,33 @@ def update_status(s):
 
 
 def handle_eventbus_message(msg):
-    """Best-effort handling of one eventbus frame. Never raises."""
+    """Best-effort handling of one eventbus frame. Never raises.
+
+    Kismet eventbus frames are JSON objects keyed by topic name, e.g.
+    {"GPS_LOCATION": {...}} -- the same dispatch the Kismet web UI uses.
+    A {"event": ..., "data": ...} shape is also accepted for robustness.
+    """
     try:
         if not isinstance(msg, dict):
             return
-        topic = msg.get("event") or msg.get("topic") or ""
-        data = msg.get("data", msg)
-        if not isinstance(data, dict):
-            return
-        if topic == "ALERT":
-            name = (data.get("kismet.alert.definition")
-                    or data.get("kismet.alert.text")
-                    or data.get("text") or "unknown")
-            ALERTS.labels(alert=str(name)[:48]).inc()
-        elif topic == "GPS":
-            update_gps(data)
-        elif topic == "DOT11_PROBED_SSID":
-            record_probe(probe_ssid_from_event(data))
+        if "event" in msg or "topic" in msg:
+            events = [(msg.get("event") or msg.get("topic") or "",
+                       msg.get("data", msg))]
+        else:
+            events = list(msg.items())
+        for topic, data in events:
+            if not isinstance(data, dict):
+                continue
+            if topic == "ALERT":
+                name = (data.get("kismet.alert.header")
+                        or data.get("kismet.alert.definition")
+                        or data.get("kismet.alert.text")
+                        or data.get("text") or "unknown")
+                ALERTS.labels(alert=str(name)[:48]).inc()
+            elif topic in ("GPS_LOCATION", "GPS"):
+                update_gps(data)
+            elif topic == "DOT11_PROBED_SSID":
+                record_probe(probe_ssid_from_event(data))
     except Exception as exc:  # never let the bus thread die loudly
         LOG.debug("eventbus message skipped: %s", exc)
 
@@ -369,12 +379,15 @@ _logged_probe_layout = False
 
 def probe_ssid_from_event(data):
     global _logged_probe_layout
+    # The event payload may nest the record under its topic name.
+    sub = data.get("DOT11_PROBED_SSID")
+    target = sub if isinstance(sub, dict) else data
     if not _logged_probe_layout:
         _logged_probe_layout = True
         LOG.info("first DOT11_PROBED_SSID payload keys: %s",
-                 sorted(str(k) for k in data.keys()))
+                 sorted(str(k) for k in target.keys()))
     for key in _PROBE_SSID_KEYS:
-        value = data.get(key)
+        value = target.get(key)
         if value:
             return str(value)
     return "(unknown)"
@@ -387,8 +400,8 @@ def record_probe(ssid):
 
 
 def eventbus_loop(source):
-    """Subscribe to ALERT + GPS topics. Runs forever; REST polling covers us
-    if this thread can never connect."""
+    """Subscribe to ALERT, GPS_LOCATION, and DOT11_PROBED_SSID topics.
+    Runs forever; REST polling covers us if this thread can never connect."""
     if DEMO or not HAS_WS or not isinstance(source, KismetSource):
         return
     ws_url = source.eventbus_url()
@@ -397,9 +410,10 @@ def eventbus_loop(source):
     while True:
         try:
             ws = websocket.create_connection(ws_url, timeout=15)
-            for topic in ("ALERT", "GPS", "DOT11_PROBED_SSID"):
+            for topic in ("ALERT", "GPS_LOCATION", "DOT11_PROBED_SSID"):
                 ws.send(json.dumps({"SUBSCRIBE": topic}))
-            LOG.info("eventbus: subscribed to ALERT, GPS, DOT11_PROBED_SSID")
+            LOG.info("eventbus: subscribed to ALERT, GPS_LOCATION, "
+                     "DOT11_PROBED_SSID")
             while True:
                 handle_eventbus_message(json.loads(ws.recv()))
         except Exception as exc:
